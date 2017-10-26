@@ -104,7 +104,7 @@ class NMTLossCompute(LossComputeBase):
         return loss, stats
 
 
-def make_gen_state(output, batch, attns, range_, copy_attn=None):
+def make_gen_state(output, batch, attns, range_, copy_attn=None, hidden=None):
     """
     Create generator state for use in sharded loss computation.
     This needs to match compute_loss exactly.
@@ -113,12 +113,15 @@ def make_gen_state(output, batch, attns, range_, copy_attn=None):
         raise AssertionError("using -copy_attn you need to pass in "
                              "-dynamic_dict during preprocess stage.")
 
-    return {"output": output,
-            "target": batch.tgt[range_[0] + 1: range_[1]],
+    resu = {"output": output,
+            "target": batch.tgt[0][range_[0] + 1: range_[1]],
             "copy_attn": attns.get("copy"),
             "align": None if not copy_attn
             else batch.alignment[range_[0] + 1: range_[1]],
             "coverage": attns.get("coverage")}
+    if hidden is not None:
+        resu['hidden'] = hidden
+    return resu
 
 
 def filter_gen_state(state):
@@ -173,3 +176,58 @@ def shards(state, shard_size, eval=False):
                      if isinstance(v, Variable) and v.grad is not None)
         inputs, grads = zip(*variables)
         torch.autograd.backward(inputs, grads)
+
+class VAENMTLossCompute(LossComputeBase):
+    """
+    Standard NMT Loss Computation.
+    """
+    def __init__(self, opt, generator, tgt_vocab, bow_project):
+        super(VAENMTLossCompute, self).__init__(generator, tgt_vocab)
+
+        self.copy_attn = False
+        weight = torch.ones(len(tgt_vocab))
+        weight[self.padding_idx] = 0
+        self.criterion = nn.NLLLoss(weight, size_average=False)
+        self.bow_project = bow_project
+
+    def compute_loss(self, batch, output, target, **kwargs):
+        """ See base class for args description. """
+        scores = self.generator(self.bottle(output))
+        scores_data = scores.data.clone()
+
+        target = target.view(-1)
+        target_data = target.data.clone()
+
+        loss = self.criterion(scores, target)
+        loss_data = loss.data.clone()
+
+        stats = self.stats(loss_data, scores_data, target_data)
+
+        assert 'hidden' in kwargs
+        hidden = kwargs['hidden']
+        bow_scores = self.bow_project(self.bottle(hidden))
+        loss_add = self.criterion(bow_scores, target)
+        # print(loss_add.mean())
+        loss += loss_add
+
+        return loss, stats
+
+    def sharded_compute_loss(self, batch, output, attns,
+                             cur_trunc, trunc_size, shard_size, hidden, kld):
+        """
+        Compute the loss in shards for efficiency.
+        """
+        batch_stats = onmt.Statistics()
+        range_ = (cur_trunc, cur_trunc + trunc_size)
+        gen_state = make_gen_state(output, batch, attns, range_,
+                                   self.copy_attn, hidden)
+
+        kld = torch.mean(kld)
+        # print(kld)
+        kld.backward(retain_variables=True)
+        for shard in shards(gen_state, shard_size):
+            loss, stats = self.compute_loss(batch, **shard)
+            loss.div(batch.batch_size).backward()
+            batch_stats.update(stats)
+
+        return batch_stats
