@@ -90,13 +90,32 @@ class RNNEncoder(EncoderBase):
         packed_emb = emb
         if lengths is not None and not self.no_pack_padded_seq:
             # Lengths data is wrapped inside a Variable.
-            lengths = lengths.view(-1).tolist()
-            packed_emb = pack(emb, lengths)
+            lengths = lengths.view(-1)
+            lengths, idxs = torch.sort(lengths, 0, True)
+            idxs_exp = idxs.unsqueeze(0).unsqueeze(2).expand_as(emb)
+            idxs_exp = Variable(idxs_exp)
+            emb = emb.gather(1, idxs_exp)
+            packed_emb = pack(emb, lengths.tolist())
 
         outputs, hidden_t = self.rnn(packed_emb, hidden)
 
         if lengths is not None and not self.no_pack_padded_seq:
             outputs = unpack(outputs)[0]
+            _, idxs = torch.sort(idxs, 0)
+            idxs_exp = idxs.unsqueeze(0).unsqueeze(2).expand_as(outputs)
+            idxs_exp = Variable(idxs_exp)
+            outputs = outputs.gather(1, idxs_exp)
+            if isinstance(hidden_t, tuple):
+                hidden_t_res = []
+                for h in hidden_t:
+                    idxs_exp = idxs.unsqueeze(0).unsqueeze(2).expand_as(h)
+                    idxs_exp = Variable(idxs_exp)
+                    hidden_t_res.append(h.gather(1, idxs_exp))
+                hidden_t = tuple(hidden_t_res)
+            else:
+                idxs_exp = idxs.unsqueeze(0).unsqueeze(2).expand_as(hidden_t)
+                idxs_exp = Variable(idxs_exp)
+                hidden_t = hidden_t.gather(1, idxs_exp)
 
         return hidden_t, outputs
 
@@ -491,3 +510,107 @@ class RNNDecoderState(DecoderState):
                 for e in self._all]
         self.hidden = tuple(vars[:-1])
         self.input_feed = vars[-1]
+
+class VAENMTModel(nn.Module):
+    """
+    The encoder + decoder Neural Machine Translation Model.
+    """
+    def __init__(self, opt, u_encoder, c_encoder, decoder, multigpu=False):
+        """
+        Args:
+            u_encoder(*Encoder): the various utterance encoder.
+            c_encoder(*Encoder): the various context encoder.
+            decoder(*Decoder): the various decoder.
+            multigpu(bool): run parellel on multi-GPU?
+        """
+        self.multigpu = multigpu
+        super(VAENMTModel, self).__init__()
+        self.u_encoder = u_encoder
+        self.c_encoder = c_encoder
+        self.decoder = decoder
+        hidden_out_size = opt.dec_layers * opt.rnn_size
+        self.recogNet_mulogvar = nn.Linear(hidden_out_size * 2, opt.z_size * 2)
+        self.priorNet_mulogvar = nn.Sequential(
+            nn.Linear(hidden_out_size, opt.mid_size),
+            nn.Tanh(),
+            nn.Linear(opt.mid_size, opt.z_size * 2))
+        self.dec_init_state_net = nn.Linear(opt.z_size + hidden_out_size, hidden_out_size)
+
+    def forward(self, src, tgt,  src_lengths, tgt_lengths, dec_state=None):
+        """
+        Args:
+            src(FloatTensor): a sequence of source tensors with
+                    optional feature tensors of size (len x batch).
+            tgt(FloatTensor): a sequence of target tensors with
+                    optional feature tensors of size (len x batch).
+            lengths([int]): an array of the src length.
+            dec_state: A decoder state object
+        Returns:
+            outputs (FloatTensor): (len x batch x hidden_size): decoder outputs
+            attns (FloatTensor): Dictionary of (src_len x batch)
+            dec_hidden (FloatTensor): tuple (1 x batch x hidden_size)
+                                      Init hidden state
+        """
+        is_tuple = False
+        c_enc_hidden, c_context = self.c_encoder(src, src_lengths)
+        u_enc_hidden, u_context = self.u_encoder(tgt, tgt_lengths)
+        if isinstance(c_enc_hidden, tuple):
+            c_enc_hidden = c_enc_hidden[0]
+        if isinstance(u_enc_hidden, tuple):
+            u_enc_hidden = u_enc_hidden[0]
+            is_tuple = True
+
+        _, batch_size, dim = c_enc_hidden.size()
+        c_enc_hidden_t = c_enc_hidden.permute(1, 0, 2).contiguous().view(batch_size, -1)
+        u_enc_hidden_t = u_enc_hidden.permute(1, 0, 2).contiguous().view(batch_size, -1)
+
+        recog_mulogvar = self.recogNet_mulogvar(torch.cat([c_enc_hidden_t, u_enc_hidden_t], 1))
+        recog_mu, recog_logvar = torch.chunk(recog_mulogvar, 2, 1)
+
+        prior_mulogvar = self.priorNet_mulogvar(c_enc_hidden_t)
+
+        recog_mu, recog_logvar = torch.chunk(recog_mulogvar, 2, 1)
+        prior_mu, prior_logvar = torch.chunk(prior_mulogvar, 2, 1)
+
+        kld = gaussian_kld(recog_mu, recog_logvar, prior_mu, prior_logvar)
+
+        if self.training:
+            latent_sample = sample_gaussian(recog_mu, recog_logvar)
+        else:
+            latent_sample = sample_gaussian(prior_mu, prior_logvar)
+
+        latent_sample_cat = torch.cat([latent_sample, c_enc_hidden_t], 1)
+
+        init_state = self.dec_init_state_net(latent_sample_cat)
+        enc_hidden = init_state.view(batch_size, dim, -1).permute(2, 0, 1).contiguous()
+        if is_tuple:
+            enc_hidden = tuple([enc_hidden, enc_hidden])
+
+        tgt = tgt[:-1]  # exclude last target from inputs
+        context = c_context
+        enc_state = self.decoder.init_decoder_state(src, context, enc_hidden)
+        out, dec_state, attns = self.decoder(tgt, context,
+                                             enc_state if dec_state is None
+                                             else dec_state)
+
+        batch_size, dim = latent_sample_cat.size()
+        hidden = latent_sample_cat.unsqueeze(0).expand(out.size(0), batch_size, dim).contiguous()
+
+        if self.multigpu:
+            # Not yet supported on multi-gpu
+            dec_state = None
+            attns = None
+        return out, attns, dec_state, kld, hidden
+
+def gaussian_kld(recog_mu, recog_logvar, prior_mu, prior_logvar):
+    kld = -0.5 * torch.sum(1 + (recog_logvar - prior_logvar)
+                               - torch.div(torch.pow(prior_mu - recog_mu, 2), torch.exp(prior_logvar))
+                               - torch.div(torch.exp(recog_logvar), torch.exp(prior_logvar)), 1)
+    return kld
+
+def sample_gaussian(mu, logvar):
+    epsilon = Variable(logvar.data.new(logvar.size()).normal_())
+    std = torch.exp(0.5 * logvar)
+    z= mu + std * epsilon
+    return z
+
