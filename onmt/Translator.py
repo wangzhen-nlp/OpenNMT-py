@@ -221,3 +221,158 @@ class Translator(object):
                     self.buildTargetTokens(tgt[1:, b], src[:, b],
                                            None, None))
         return predBatch, goldBatch, predScore, goldScore, attn, src
+
+class VAETranslator(Translator):
+    def __init__(self, opt, dummy_opt={}):
+        # Add in default model arguments, possibly added since training.
+        self.opt = opt
+        checkpoint = torch.load(opt.model,
+                                map_location=lambda storage, loc: storage)
+        self.fields = onmt.IO.ONMTDataset.load_fields(checkpoint['vocab'])
+
+        model_opt = checkpoint['opt']
+        for arg in dummy_opt:
+            if arg not in model_opt:
+                model_opt.__dict__[arg] = dummy_opt[arg]
+
+        self._type = model_opt.encoder_type
+        self.copy_attn = model_opt.copy_attn
+
+        self.model = onmt.ModelConstructor.make_vae_base_model(
+                            model_opt, self.fields, use_gpu(opt), checkpoint)
+        self.model.eval()
+        self.model.generator.eval()
+
+        # for debugging
+        self.beam_accum = None
+
+    def translateBatch(self, batch, dataset):
+        beam_size = self.opt.beam_size
+        batch_size = batch.batch_size
+
+        # (1) Run the encoder on the src.
+        _, src_lengths = batch.src
+        src = onmt.IO.make_features(batch, 'src')
+        c_enc_hidden, c_context = self.model.c_encoder(src, src_lengths)
+
+        is_tuple = False
+        if isinstance(c_enc_hidden, tuple):
+            c_enc_hidden= c_enc_hidden[0]
+            is_tuple = True
+
+        _, batch_size, dim = c_enc_hidden.size()
+
+        c_enc_hidden_t = c_enc_hidden.permute(1, 0, 2).contiguous().view(batch_size, -1)
+        prior_mulogvar = self.model.priorNet_mulogvar(c_enc_hidden_t)
+        prior_mu, prior_logvar = torch.chunk(prior_mulogvar, 2, 1)
+        latent_sample = sample_gaussian(prior_mu, prior_logvar)
+        latent_sample_cat = torch.cat([latent_sample, c_enc_hidden_t], 1)
+        init_state = self.model.dec_init_state_net(latent_sample_cat)
+        enc_hidden = init_state.view(batch_size, dim, -1).permute(2, 0, 1).contiguous()
+        if is_tuple:
+            enc_hidden = tuple([enc_hidden, enc_hidden])
+        context = c_context
+        encStates = enc_hidden
+
+        decStates = self.model.decoder.init_decoder_state(
+                                        src, context, encStates)
+
+        #  (1b) Initialize for the decoder.
+        def var(a): return Variable(a, volatile=True)
+
+        def rvar(a): return var(a.repeat(1, beam_size, 1))
+
+        # Repeat everything beam_size times.
+        context = rvar(context.data)
+        src = rvar(src.data)
+        srcMap = rvar(batch.src_map.data)
+        decStates.repeat_beam_size_times(beam_size)
+        scorer = None
+        # scorer=onmt.GNMTGlobalScorer(0.3, 0.4)
+        beam = [onmt.Beam(beam_size, n_best=self.opt.n_best,
+                          cuda=self.opt.cuda,
+                          vocab=self.fields["tgt"].vocab,
+                          global_scorer=scorer)
+                for __ in range(batch_size)]
+
+        # (2) run the decoder to generate sentences, using beam search.
+
+        def bottle(m):
+            return m.view(batch_size * beam_size, -1)
+
+        def unbottle(m):
+            return m.view(beam_size, batch_size, -1)
+
+        for i in range(self.opt.max_sent_length):
+
+            if all((b.done() for b in beam)):
+                break
+
+            # Construct batch x beam_size nxt words.
+            # Get all the pending current beam words and arrange for forward.
+            inp = var(torch.stack([b.getCurrentState() for b in beam])
+                      .t().contiguous().view(1, -1))
+
+            # Turn any copied words to UNKs
+            # 0 is unk
+            if self.copy_attn:
+                inp = inp.masked_fill(
+                    inp.gt(len(self.fields["tgt"].vocab) - 1), 0)
+
+            # Temporary kludge solution to handle changed dim expectation
+            # in the decoder
+            inp = inp.unsqueeze(2)
+
+            # Run one step.
+            decOut, decStates, attn = \
+                self.model.decoder(inp, context, decStates)
+            decOut = decOut.squeeze(0)
+            # decOut: beam x rnn_size
+
+            # (b) Compute a vector of batch*beam word scores.
+            if not self.copy_attn:
+                out = self.model.generator.forward(decOut).data
+                out = unbottle(out)
+                # beam x tgt_vocab
+            else:
+                out = self.model.generator.forward(decOut,
+                                                   attn["copy"].squeeze(0),
+                                                   srcMap)
+                # beam x (tgt_vocab + extra_vocab)
+                out = dataset.collapse_copy_scores(
+                    unbottle(out.data),
+                    batch, self.fields["tgt"].vocab)
+                # beam x tgt_vocab
+                out = out.log()
+
+            # (c) Advance each beam.
+            for j, b in enumerate(beam):
+                b.advance(out[:, j],  unbottle(attn["std"]).data[:, j])
+                decStates.beam_update(j, b.getCurrentOrigin(), beam_size)
+
+        if "tgt" in batch.__dict__:
+            allGold = self._runTarget(batch, dataset)
+        else:
+            allGold = [0] * batch_size
+
+        # (3) Package everything up.
+        allHyps, allScores, allAttn = [], [], []
+        for b in beam:
+            n_best = self.opt.n_best
+            scores, ks = b.sortFinished(minimum=n_best)
+            hyps, attn = [], []
+            for i, (times, k) in enumerate(ks[:n_best]):
+                hyp, att = b.getHyp(times, k)
+                hyps.append(hyp)
+                attn.append(att)
+            allHyps.append(hyps)
+            allScores.append(scores)
+            allAttn.append(attn)
+
+        return allHyps, allScores, allAttn, allGold
+
+def sample_gaussian(mu, logvar):
+    epsilon = Variable(logvar.data.new(logvar.size()).normal_())
+    std = torch.exp(0.5 * logvar)
+    z= mu + std * epsilon
+    return z
