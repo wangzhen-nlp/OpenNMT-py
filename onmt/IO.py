@@ -308,7 +308,8 @@ class ONMTDataset(torchtext.data.Dataset):
 
         fields["tgt"] = torchtext.data.Field(
             init_token=BOS_WORD, eos_token=EOS_WORD,
-            pad_token=PAD_WORD)
+            pad_token=PAD_WORD,
+            include_lengths=True)
 
         def make_src(data, _):
             src_size = max([t.size(0) for t in data])
