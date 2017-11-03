@@ -144,6 +144,9 @@ class Translator(object):
             # in the decoder
             inp = inp.unsqueeze(2)
 
+            # print(inp)
+            # print(decStates.hidden)
+            # print(decStates.input_feed)
             # Run one step.
             decOut, decStates, attn = \
                 self.model.decoder(inp, context, decStates)
@@ -372,7 +375,7 @@ class VAETranslator(Translator):
         return allHyps, allScores, allAttn, allGold
 
 def sample_gaussian(mu, logvar):
-    epsilon = Variable(logvar.data.new(logvar.size()).normal_())
+    epsilon = Variable(logvar.data.new(logvar.size()).normal_()) * 10
     std = torch.exp(0.5 * logvar)
     z= mu + std * epsilon
     return z

@@ -8,7 +8,6 @@ from torch.nn.utils.rnn import pad_packed_sequence as unpack
 import onmt
 from onmt.Utils import aeq
 
-
 class EncoderBase(nn.Module):
     """
     EncoderBase class for sharing code among various encoder.
@@ -195,16 +194,17 @@ class RNNDecoderBase(nn.Module):
 
         # Update the state with the result.
         final_output = outputs[-1]
-        state.update_state(hidden, final_output.unsqueeze(0),
-                           coverage.unsqueeze(0)
-                           if coverage is not None else None)
+        post_state = state.clone()
+        post_state.update_state(hidden, final_output.unsqueeze(0),
+                                coverage.unsqueeze(0)
+                                if coverage is not None else None)
 
         # Concatenates sequence of tensors along a new dimension.
         outputs = torch.stack(outputs)
         for k in attns:
             attns[k] = torch.stack(attns[k])
 
-        return outputs, state, attns
+        return outputs, post_state, attns
 
     def _fix_enc_hidden(self, h):
         """
@@ -469,7 +469,7 @@ class DecoderState(object):
 
 
 class RNNDecoderState(DecoderState):
-    def __init__(self, context, hidden_size, rnnstate):
+    def __init__(self, context=None, hidden_size=None, rnnstate=None):
         """
         Args:
             context (FloatTensor): output from the encoder of size
@@ -480,17 +480,26 @@ class RNNDecoderState(DecoderState):
             input_feed (FloatTensor): output from last layer of the decoder.
             coverage (FloatTensor): coverage output from the decoder.
         """
-        if not isinstance(rnnstate, tuple):
-            self.hidden = (rnnstate,)
-        else:
-            self.hidden = rnnstate
+        if rnnstate is not None:
+            if not isinstance(rnnstate, tuple):
+                self.hidden = (rnnstate,)
+            else:
+                self.hidden = rnnstate
         self.coverage = None
 
         # Init the input feed.
-        batch_size = context.size(1)
-        h_size = (batch_size, hidden_size)
-        self.input_feed = Variable(context.data.new(*h_size).zero_(),
-                                   requires_grad=False).unsqueeze(0)
+        if context is not None and hidden_size is not None:
+            batch_size = context.size(1)
+            h_size = (batch_size, hidden_size)
+            self.input_feed = Variable(context.data.new(*h_size).zero_(),
+                                       requires_grad=False).unsqueeze(0)
+
+    def clone(self):
+        state = RNNDecoderState()
+        state.hidden = self.hidden
+        state.input_feed = self.input_feed
+        state.coverage = self.coverage
+        return state
 
     @property
     def _all(self):

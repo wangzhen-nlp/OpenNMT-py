@@ -78,6 +78,8 @@ class Beam(object):
             beamLk = wordLk[0]
         flatBeamLk = beamLk.view(-1)
         bestScores, bestScoresId = flatBeamLk.topk(self.size, 0, True, True)
+        print(sorted(bestScores.view(-1).cpu().numpy()))
+        input()
 
         self.allScores.append(self.scores)
         self.scores = bestScores
